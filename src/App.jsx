@@ -1,7 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  onSnapshot,
+  setDoc,
+  updateDoc,
+} from "firebase/firestore";
+import { db, missingFirebaseConfig } from "./firebase";
 
-const STORAGE_KEY = "rehabpt-pass-tracker-v1";
-const CLINIC_NAME = "RehabPT";
+const SETTINGS_DOC_ID = "general";
+const COLLECTIONS = {
+  hbot: "hbotPatients",
+  softwave: "softwavePatients",
+};
 
 const defaultTemplates = {
   hbotExpiringSoon:
@@ -17,23 +30,8 @@ const defaultTemplates = {
 const emptyData = {
   hbot: [],
   softwave: [],
-  settings: { templates: defaultTemplates },
+  settings: { clinicName: "RehabPT", templates: defaultTemplates },
 };
-
-function loadData() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    return {
-      hbot: Array.isArray(saved?.hbot) ? saved.hbot : [],
-      softwave: Array.isArray(saved?.softwave) ? saved.softwave : [],
-      settings: {
-        templates: { ...defaultTemplates, ...(saved?.settings?.templates || {}) },
-      },
-    };
-  } catch {
-    return emptyData;
-  }
-}
 
 function uid() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -179,15 +177,15 @@ function reminderInfo(patient, service) {
   return null;
 }
 
-function buildReminderMessage(patient, service, templates) {
+function buildReminderMessage(patient, service, settings) {
   const info = reminderInfo(patient, service);
   if (!info) return "";
-  return templates[info[0]]
+  return settings.templates[info[0]]
     .replaceAll("{firstName}", firstName(patient.name))
     .replaceAll("{fullName}", patient.name)
     .replaceAll("{expirationDate}", formatDate(patient.adjustedEndDate))
     .replaceAll("{remainingSessions}", String(softwaveRemaining(patient)))
-    .replaceAll("{clinicName}", CLINIC_NAME);
+    .replaceAll("{clinicName}", settings.clinicName || "RehabPT");
 }
 
 function normalizeHbotPatient(patient) {
@@ -201,24 +199,130 @@ function normalizeHbotPatient(patient) {
   };
 }
 
+function normalizeSettingsDoc(settings = {}) {
+  return {
+    clinicName: settings.clinicName || "RehabPT",
+    templates: {
+      hbotExpiringSoon: settings.hbotExpiringSoonTemplate || defaultTemplates.hbotExpiringSoon,
+      hbotExpired: settings.hbotExpiredTemplate || defaultTemplates.hbotExpired,
+      softwaveLowRemaining:
+        settings.softwaveLowRemainingTemplate || defaultTemplates.softwaveLowRemaining,
+      softwaveCompleted: settings.softwaveCompletedTemplate || defaultTemplates.softwaveCompleted,
+    },
+  };
+}
+
+function settingsToFirestore(settings) {
+  return {
+    clinicName: settings.clinicName || "RehabPT",
+    hbotExpiringSoonTemplate:
+      settings.templates?.hbotExpiringSoon || defaultTemplates.hbotExpiringSoon,
+    hbotExpiredTemplate: settings.templates?.hbotExpired || defaultTemplates.hbotExpired,
+    softwaveLowRemainingTemplate:
+      settings.templates?.softwaveLowRemaining || defaultTemplates.softwaveLowRemaining,
+    softwaveCompletedTemplate:
+      settings.templates?.softwaveCompleted || defaultTemplates.softwaveCompleted,
+  };
+}
+
+function normalizeSoftwavePatient(patient) {
+  const sessionHistory = patient.sessionHistory || [];
+  const packageSize = patient.packageSize || 8;
+  return {
+    ...patient,
+    packageSize,
+    sessionHistory,
+    usedSessions: sessionHistory.length,
+    remainingSessions: Math.max(0, packageSize - sessionHistory.length),
+  };
+}
+
+function collectionName(service) {
+  return COLLECTIONS[service];
+}
+
 export default function App() {
-  const [data, setData] = useState(loadData);
+  const [data, setData] = useState(emptyData);
   const [service, setService] = useState("hbot");
   const [view, setView] = useState("tracker");
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [modal, setModal] = useState(null);
   const [toast, setToast] = useState("");
+  const [isLoading, setIsLoading] = useState(Boolean(db));
+  const [loadError, setLoadError] = useState("");
   const [focusPatientId, setFocusPatientId] = useState("");
-  const didLoad = useRef(false);
+  const toastTimer = useRef(null);
 
   useEffect(() => {
-    if (!didLoad.current) {
-      didLoad.current = true;
+    if (!db) {
+      setIsLoading(false);
       return;
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  }, [data]);
+    const unsubscribers = [
+      onSnapshot(
+        collection(db, "hbotPatients"),
+        (snapshot) => {
+          setData((current) => ({
+            ...current,
+            hbot: snapshot.docs.map((item) =>
+              normalizeHbotPatient({
+                id: item.id,
+                breaks: [],
+                notes: [],
+                reminderLog: [],
+                ...item.data(),
+              }),
+            ),
+          }));
+          setIsLoading(false);
+        },
+        (error) => {
+          setLoadError(error.message);
+          setIsLoading(false);
+        },
+      ),
+      onSnapshot(
+        collection(db, "softwavePatients"),
+        (snapshot) => {
+          setData((current) => ({
+            ...current,
+            softwave: snapshot.docs.map((item) =>
+              normalizeSoftwavePatient({
+                id: item.id,
+                notes: [],
+                reminderLog: [],
+                sessionHistory: [],
+                ...item.data(),
+              }),
+            ),
+          }));
+          setIsLoading(false);
+        },
+        (error) => {
+          setLoadError(error.message);
+          setIsLoading(false);
+        },
+      ),
+      onSnapshot(
+        doc(db, "settings", SETTINGS_DOC_ID),
+        (snapshot) => {
+          if (!snapshot.exists()) {
+            setDoc(doc(db, "settings", SETTINGS_DOC_ID), settingsToFirestore(emptyData.settings));
+            setData((current) => ({ ...current, settings: emptyData.settings }));
+            return;
+          }
+          setData((current) => ({
+            ...current,
+            settings: normalizeSettingsDoc(snapshot.data()),
+          }));
+        },
+        (error) => setLoadError(error.message),
+      ),
+    ];
+
+    return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
+  }, []);
 
   useEffect(() => {
     if (!focusPatientId || view !== "tracker" || modal) return;
@@ -253,58 +357,62 @@ export default function App() {
 
   function showToast(message) {
     setToast(message);
-    setTimeout(() => setToast(""), 2600);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(""), 2600);
   }
 
-  function updatePatient(id, updater) {
-    setData((current) => ({
-      ...current,
-      [service]: current[service].map((patient) => {
-        if (patient.id !== id) return patient;
-        const next = structuredClone(patient);
-        updater(next);
-        return service === "hbot" ? normalizeHbotPatient(next) : next;
-      }),
-    }));
+  async function updatePatient(id, updater) {
+    if (!db) return;
+    const current = findPatient(id);
+    if (!current) return;
+    const next = structuredClone(current);
+    updater(next);
+    const normalized = service === "hbot" ? normalizeHbotPatient(next) : normalizeSoftwavePatient(next);
+    const { id: _id, ...payload } = normalized;
+    await updateDoc(doc(db, collectionName(service), id), {
+      ...payload,
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   function findPatient(id) {
     return data[service].find((patient) => patient.id === id);
   }
 
-  function addPatient(formData) {
+  async function addPatient(formData) {
+    if (!db) return;
     const name = String(formData.get("name") || "").trim();
     const phone = String(formData.get("phone") || "").trim();
     if (!name) return;
+    const now = new Date().toISOString();
     const base = {
-      id: uid(),
       name,
       phone,
       notes: [],
       reminderLog: [],
-      createdAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
     };
 
-    setData((current) => {
-      if (service === "hbot") {
-        const passStartDate = String(formData.get("passStartDate") || "");
-        const patient = normalizeHbotPatient({ ...base, passStartDate, breaks: [] });
-        return { ...current, hbot: [...current.hbot, patient] };
-      }
-      return {
-        ...current,
-        softwave: [
-          ...current.softwave,
-          { ...base, packageSize: 8, sessionHistory: [], lastSessionDate: "" },
-        ],
-      };
-    });
+    if (service === "hbot") {
+      const passStartDate = String(formData.get("passStartDate") || "");
+      const patient = normalizeHbotPatient({ ...base, passStartDate, breaks: [] });
+      await addDoc(collection(db, "hbotPatients"), patient);
+    } else {
+      const patient = normalizeSoftwavePatient({
+        ...base,
+        packageSize: 8,
+        sessionHistory: [],
+        lastSessionDate: "",
+      });
+      await addDoc(collection(db, "softwavePatients"), patient);
+    }
     setModal(null);
     showToast(`${name} added to ${serviceLabel(service)}.`);
   }
 
-  function saveHbot(id, formData) {
-    updatePatient(id, (patient) => {
+  async function saveHbot(id, formData) {
+    await updatePatient(id, (patient) => {
       patient.name = String(formData.get("name") || "").trim();
       patient.phone = String(formData.get("phone") || "").trim();
       patient.passStartDate = String(formData.get("passStartDate") || "");
@@ -312,8 +420,8 @@ export default function App() {
     showToast("HBOT patient saved.");
   }
 
-  function saveSoftwave(id, formData) {
-    updatePatient(id, (patient) => {
+  async function saveSoftwave(id, formData) {
+    await updatePatient(id, (patient) => {
       patient.name = String(formData.get("name") || "").trim();
       patient.phone = String(formData.get("phone") || "").trim();
       patient.packageSize = Math.max(1, Number(formData.get("packageSize")) || 8);
@@ -321,14 +429,14 @@ export default function App() {
     showToast("SoftWave patient saved.");
   }
 
-  function saveBreak(id, breakId, formData) {
+  async function saveBreak(id, breakId, formData) {
     const startDate = String(formData.get("startDate") || "");
     const endDate = String(formData.get("endDate") || "");
     if (parseLocalDate(endDate) < parseLocalDate(startDate)) {
       showToast("Break end date must be on or after start date.");
       return;
     }
-    updatePatient(id, (patient) => {
+    await updatePatient(id, (patient) => {
       const item = {
         id: breakId || uid(),
         startDate,
@@ -343,25 +451,25 @@ export default function App() {
     showToast("Break saved and pass end date updated.");
   }
 
-  function deleteBreak(id, breakId) {
-    updatePatient(id, (patient) => {
+  async function deleteBreak(id, breakId) {
+    await updatePatient(id, (patient) => {
       patient.breaks = (patient.breaks || []).filter((item) => item.id !== breakId);
     });
     showToast("Break deleted and pass end date updated.");
   }
 
-  function addNote(id, formData) {
+  async function addNote(id, formData) {
     const text = String(formData.get("note") || "").trim();
     if (!text) return;
-    updatePatient(id, (patient) => {
+    await updatePatient(id, (patient) => {
       patient.notes = patient.notes || [];
       patient.notes.unshift({ id: uid(), dateTime: new Date().toISOString(), text });
     });
     showToast("Note added.");
   }
 
-  function addSession(id) {
-    updatePatient(id, (patient) => {
+  async function addSession(id) {
+    await updatePatient(id, (patient) => {
       if (softwaveRemaining(patient) <= 0) return;
       patient.sessionHistory = patient.sessionHistory || [];
       patient.sessionHistory.unshift({ id: uid(), dateTime: new Date().toISOString() });
@@ -370,8 +478,8 @@ export default function App() {
     showToast("Session logged.");
   }
 
-  function undoSession(id) {
-    updatePatient(id, (patient) => {
+  async function undoSession(id) {
+    await updatePatient(id, (patient) => {
       patient.sessionHistory = patient.sessionHistory || [];
       patient.sessionHistory.shift();
       const last = patient.sessionHistory[0];
@@ -380,8 +488,8 @@ export default function App() {
     showToast("Last session undone.");
   }
 
-  function renewSoftwave(id) {
-    updatePatient(id, (patient) => {
+  async function renewSoftwave(id) {
+    await updatePatient(id, (patient) => {
       patient.packageSize = (patient.packageSize || 8) + 8;
     });
     showToast("8 sessions added to SoftWave package.");
@@ -389,7 +497,7 @@ export default function App() {
 
   async function openReminder(id) {
     const patient = findPatient(id);
-    const message = buildReminderMessage(patient, service, data.settings.templates);
+    const message = buildReminderMessage(patient, service, data.settings);
     setModal({ type: "reminder", id });
     try {
       await navigator.clipboard?.writeText(message);
@@ -399,12 +507,12 @@ export default function App() {
     }
   }
 
-  function markReminderSent(id) {
+  async function markReminderSent(id) {
     const patient = findPatient(id);
     const info = reminderInfo(patient, service);
     if (!patient || !info) return;
-    const message = buildReminderMessage(patient, service, data.settings.templates);
-    updatePatient(id, (item) => {
+    const message = buildReminderMessage(patient, service, data.settings);
+    await updatePatient(id, (item) => {
       item.reminderLog = item.reminderLog || [];
       item.reminderLog.unshift({
         id: uid(),
@@ -420,23 +528,34 @@ export default function App() {
     showToast("Reminder marked as sent.");
   }
 
-  function deletePatient(id) {
+  async function deletePatient(id) {
     const patient = findPatient(id);
+    if (!db) return;
     if (!patient || !window.confirm(`Delete ${patient.name} from ${serviceLabel(service)}?`)) return;
-    setData((current) => ({
-      ...current,
-      [service]: current[service].filter((item) => item.id !== id),
-    }));
+    await deleteDoc(doc(db, collectionName(service), id));
     setModal(null);
     showToast("Patient deleted.");
   }
 
-  function saveSettings(formData) {
+  async function saveSettings(formData) {
+    if (!db) return;
     const templates = Object.fromEntries(
       Object.keys(defaultTemplates).map((key) => [key, String(formData.get(key) || "")]),
     );
-    setData((current) => ({ ...current, settings: { templates } }));
+    const settings = {
+      clinicName: String(formData.get("clinicName") || "RehabPT").trim() || "RehabPT",
+      templates,
+    };
+    await setDoc(doc(db, "settings", SETTINGS_DOC_ID), settingsToFirestore(settings), { merge: true });
     showToast("Settings saved.");
+  }
+
+  async function resetSettings() {
+    if (!db) return;
+    await setDoc(doc(db, "settings", SETTINGS_DOC_ID), settingsToFirestore(emptyData.settings), {
+      merge: true,
+    });
+    showToast("Templates reset to defaults.");
   }
 
   return (
@@ -479,14 +598,28 @@ export default function App() {
       </header>
 
       <main className="main">
+        {!db && (
+          <section className="empty-state">
+            <h2>Firebase config is missing</h2>
+            <p>
+              Add these values to `.env.local`, then restart the dev server:{" "}
+              {missingFirebaseConfig.join(", ")}
+            </p>
+          </section>
+        )}
+        {loadError && (
+          <section className="empty-state">
+            <h2>Could not load Firestore data</h2>
+            <p>{loadError}</p>
+          </section>
+        )}
+        {isLoading && !loadError && <section className="empty-state"><h2>Loading tracker data</h2><p>Connecting to Firestore...</p></section>}
         {view === "settings" ? (
           <Settings
+            clinicName={data.settings.clinicName}
             templates={data.settings.templates}
             onBack={() => setView("tracker")}
-            onReset={() => {
-              setData((current) => ({ ...current, settings: { templates: defaultTemplates } }));
-              showToast("Templates reset to defaults.");
-            }}
+            onReset={resetSettings}
             onSave={saveSettings}
           />
         ) : (
@@ -544,11 +677,11 @@ export default function App() {
         <ReminderModal
           patient={findPatient(modal.id)}
           service={service}
-          templates={data.settings.templates}
+          settings={data.settings}
           onClose={() => setModal(null)}
           onCopy={async () => {
             await navigator.clipboard?.writeText(
-              buildReminderMessage(findPatient(modal.id), service, data.settings.templates),
+              buildReminderMessage(findPatient(modal.id), service, data.settings),
             );
             showToast("Reminder copied to clipboard.");
           }}
@@ -1066,10 +1199,10 @@ function BreakModal({ patient, breakId, onBack, onClose, onSave }) {
   );
 }
 
-function ReminderModal({ patient, service, templates, onClose, onCopy, onMarkSent }) {
+function ReminderModal({ patient, service, settings, onClose, onCopy, onMarkSent }) {
   if (!patient) return null;
   const info = reminderInfo(patient, service);
-  const message = buildReminderMessage(patient, service, templates);
+  const message = buildReminderMessage(patient, service, settings);
   return (
     <Modal title="Manual Reminder" subtitle={`${patient.name} · ${info?.[1] || ""}`} onClose={onClose}>
       <div className="modal-body">
@@ -1093,7 +1226,7 @@ function ReminderModal({ patient, service, templates, onClose, onCopy, onMarkSen
   );
 }
 
-function Settings({ templates, onBack, onReset, onSave }) {
+function Settings({ clinicName, templates, onBack, onReset, onSave }) {
   return (
     <section className="settings-page">
       <div className="toolbar">
@@ -1117,6 +1250,10 @@ function Settings({ templates, onBack, onReset, onSave }) {
         }}
       >
         <div className="template-grid">
+          <label className="field">
+            <span>Clinic Name</span>
+            <input className="input" name="clinicName" defaultValue={clinicName || "RehabPT"} />
+          </label>
           <TemplateField name="hbotExpiringSoon" label="HBOT Expiring Soon" value={templates.hbotExpiringSoon} />
           <TemplateField name="hbotExpired" label="HBOT Expired" value={templates.hbotExpired} />
           <TemplateField name="softwaveLowRemaining" label="SoftWave Low Remaining" value={templates.softwaveLowRemaining} />
