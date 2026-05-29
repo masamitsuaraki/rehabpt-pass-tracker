@@ -290,6 +290,11 @@ button {
   color: var(--green-text);
 }
 
+.badge.neutral {
+  background: #eef2f7;
+  color: #475569;
+}
+
 .badge.warning {
   background: var(--amber-bg);
   color: var(--amber-text);

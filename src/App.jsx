@@ -108,6 +108,7 @@ function calculateAdjustedEnd(patient) {
 }
 
 function getHbotStatus(patient) {
+  if (!patient.passStartDate) return "No Start Date";
   const current = todayDate();
   const isOnBreak = (patient.breaks || []).some((item) => {
     const start = parseLocalDate(item.startDate);
@@ -143,6 +144,7 @@ function getStatus(patient, service) {
 }
 
 function statusClass(status) {
+  if (status === "No Start Date") return "neutral";
   if (status === "Active") return "active";
   if (status === "On Break") return "break";
   if (status === "Expired" || status === "Completed") return "danger";
@@ -175,6 +177,55 @@ function reminderInfo(patient, service) {
     if (status === "Completed") return ["softwaveCompleted", "SoftWave Completed"];
   }
   return null;
+}
+
+function dateSortValue(value) {
+  const date = parseLocalDate(value);
+  return date && !Number.isNaN(date.getTime()) ? date.getTime() : Number.MAX_SAFE_INTEGER;
+}
+
+function lastSessionSortValue(patient) {
+  const last = patient.lastSessionDate || patient.sessionHistory?.[0]?.dateTime;
+  if (!last) return 0;
+  const parsed = last.includes("T") ? new Date(last) : parseLocalDate(last);
+  return parsed && !Number.isNaN(parsed.getTime()) ? parsed.getTime() : 0;
+}
+
+function hbotSort(a, b) {
+  const priority = {
+    "No Start Date": 0,
+    "Expiring Soon": 1,
+    Active: 2,
+    "On Break": 3,
+    Expired: 4,
+  };
+  const statusA = getHbotStatus(a);
+  const statusB = getHbotStatus(b);
+  if (priority[statusA] !== priority[statusB]) return priority[statusA] - priority[statusB];
+  if (statusA === "No Start Date") return a.name.localeCompare(b.name);
+
+  const dateA = dateSortValue(a.adjustedEndDate);
+  const dateB = dateSortValue(b.adjustedEndDate);
+  if (statusA === "Expired") return dateB - dateA;
+  if (dateA !== dateB) return dateA - dateB;
+  return a.name.localeCompare(b.name);
+}
+
+function softwaveSort(a, b) {
+  const statusA = getSoftwaveStatus(a);
+  const statusB = getSoftwaveStatus(b);
+  const completedA = statusA === "Completed";
+  const completedB = statusB === "Completed";
+  if (completedA !== completedB) return completedA ? 1 : -1;
+
+  if (!completedA) {
+    const remainingDelta = softwaveRemaining(a) - softwaveRemaining(b);
+    if (remainingDelta !== 0) return remainingDelta;
+  }
+
+  const lastDelta = lastSessionSortValue(b) - lastSessionSortValue(a);
+  if (lastDelta !== 0) return lastDelta;
+  return a.name.localeCompare(b.name);
 }
 
 function buildReminderMessage(patient, service, settings) {
@@ -347,12 +398,12 @@ export default function App() {
           phone.toLowerCase().includes(query);
         return matchesSearch && (statusFilter === "all" || status === statusFilter);
       })
-      .sort((a, b) => a.name.localeCompare(b.name));
+      .sort(service === "hbot" ? hbotSort : softwaveSort);
   }, [data, search, service, statusFilter]);
 
   const statuses =
     service === "hbot"
-      ? ["Active", "Expiring Soon", "Expired", "On Break"]
+      ? ["No Start Date", "Expiring Soon", "Active", "On Break", "Expired"]
       : ["Active", "Low Remaining", "Completed"];
 
   function showToast(message) {
@@ -418,6 +469,23 @@ export default function App() {
       patient.passStartDate = String(formData.get("passStartDate") || "");
     });
     showToast("HBOT patient saved.");
+  }
+
+  async function startNewHbotMonth(id, formData) {
+    const passStartDate = String(formData.get("passStartDate") || "");
+    if (!passStartDate) return;
+    await updatePatient(id, (patient) => {
+      patient.passStartDate = passStartDate;
+      patient.breaks = [];
+      patient.notes = patient.notes || [];
+      patient.notes.unshift({
+        id: uid(),
+        dateTime: new Date().toISOString(),
+        text: `Started new HBOT month on ${formatDate(passStartDate)}`,
+      });
+    });
+    setModal({ type: "patient", id });
+    showToast("New HBOT month started.");
   }
 
   async function saveSoftwave(id, formData) {
@@ -661,7 +729,16 @@ export default function App() {
           onRenewSoftwave={renewSoftwave}
           onSaveHbot={saveHbot}
           onSaveSoftwave={saveSoftwave}
+          onStartNewMonth={(id) => setModal({ type: "start-month", id })}
           onUndoSession={undoSession}
+        />
+      )}
+      {modal?.type === "start-month" && (
+        <StartMonthModal
+          patient={findPatient(modal.id)}
+          onBack={() => setModal({ type: "patient", id: modal.id })}
+          onClose={() => setModal(null)}
+          onConfirm={(formData) => startNewHbotMonth(modal.id, formData)}
         />
       )}
       {modal?.type === "break" && (
@@ -956,7 +1033,7 @@ function PatientModal(props) {
   );
 }
 
-function HbotDetail({ patient, onAddBreak, onDeleteBreak, onEditBreak, onSaveHbot }) {
+function HbotDetail({ patient, onAddBreak, onDeleteBreak, onEditBreak, onSaveHbot, onStartNewMonth }) {
   return (
     <>
       <form
@@ -995,6 +1072,9 @@ function HbotDetail({ patient, onAddBreak, onDeleteBreak, onEditBreak, onSaveHbo
           </button>
           <button className="ghost-btn" type="button" onClick={() => onAddBreak(patient.id)}>
             Add Break
+          </button>
+          <button className="ghost-btn" type="button" onClick={() => onStartNewMonth(patient.id)}>
+            Start New Month
           </button>
         </div>
       </form>
@@ -1189,6 +1269,40 @@ function BreakModal({ patient, breakId, onBack, onClose, onSave }) {
         <div className="modal-actions">
           <button className="primary-btn" type="submit">
             Save Break
+          </button>
+          <button className="ghost-btn" type="button" onClick={onBack}>
+            Cancel
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function StartMonthModal({ patient, onBack, onClose, onConfirm }) {
+  if (!patient) return null;
+  return (
+    <Modal
+      title="Start New HBOT Month"
+      subtitle={`This will clear current breaks and replace the pass dates for ${patient.name}.`}
+      onClose={onClose}
+    >
+      <form
+        className="modal-body"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onConfirm(new FormData(event.currentTarget));
+        }}
+      >
+        <div className="form-grid">
+          <label className="field full">
+            <span>New Start Date</span>
+            <input required name="passStartDate" type="date" className="input" defaultValue={toInputDate(new Date())} />
+          </label>
+        </div>
+        <div className="modal-actions">
+          <button className="primary-btn" type="submit">
+            Start New Month
           </button>
           <button className="ghost-btn" type="button" onClick={onBack}>
             Cancel
